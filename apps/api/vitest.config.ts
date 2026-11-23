@@ -2,7 +2,7 @@ import { defineConfig } from "vite-plus";
 
 export default defineConfig({
   test: {
-    environment:"node",
+    environment: "node",
     include: ["../../tests/api/**/*.test.ts", "src/**/*.test.ts"],
     coverage: {
       enabled: false,
