@@ -1,0 +1,178 @@
+name: auto-format
+
+# Kaneo adaptation of developing-today/code's auto-format.yml (PoC #2015),
+# configured for kaneo's own formatter: vite-plus / oxc (`vp fmt`), whose
+# options live in the `fmt` block of vite.config.ts. Nothing from code's
+# treefmt/nix setup is copied.
+#
+# The four invariants, preserved:
+#   1. Formatting NEVER gates a merge: this workflow has no pull_request
+#      trigger and is not a required check. It only tidies main.
+#   2. A pass is never cancelled mid-commit: `cancel-in-progress: false`
+#      with a single group, so a queued pass waits and then finds main
+#      already clean.
+#   3. A success marker prevents re-processing and loops. The PoC stores
+#      the last formatted main SHA in the AUTO_FORMAT_LAST_SUCCESS_SHA
+#      repository variable; that variable needs a PAT to write, so when
+#      no PAT is configured this workflow uses an equivalent marker: the
+#      head SHA of the last successful auto-format run (Actions API).
+#      Either way a run whose marker equals HEAD exits immediately, and
+#      `vp fmt` is idempotent, so a stale/absent marker only re-checks a
+#      range — it can never produce a commit when nothing is misformatted.
+#   4. Bot commits go directly to the default branch (main) with a clear
+#      `style(format): auto-format on main` message, matching the PoC's
+#      `style(treefmt): auto-format on main` for this repo's formatter.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: auto-format-main
+  cancel-in-progress: false
+
+jobs:
+  format:
+    name: vp fmt auto-format
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          # A PAT, when configured, may push workflow files and update
+          # repository variables; the default token does neither. All
+          # variable writes are best-effort, so the token fallback is safe.
+          token: ${{ secrets.REPO_AUTOMATION_TOKEN || github.token }}
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.32.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+
+      - name: Install root tooling
+        run: pnpm install --frozen-lockfile --ignore-scripts --filter kaneo
+
+      - name: Format changed files and commit any fixes
+        env:
+          LAST_SUCCESS_SHA: ${{ vars.AUTO_FORMAT_LAST_SUCCESS_SHA }}
+          REPO_AUTOMATION_TOKEN: ${{ secrets.REPO_AUTOMATION_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Record a successful pass. Best-effort by design: with only the
+          # default token this call is not permitted, and the marker then
+          # falls back to this workflow's last successful run (below).
+          record_success() {
+            local sha
+            sha="$(git rev-parse HEAD)"
+            if [[ -z "${REPO_AUTOMATION_TOKEN:-}" ]]; then
+              echo "::notice::No automation PAT; the next run reads its marker from this workflow's last successful run."
+              return 0
+            fi
+            if GH_TOKEN="$REPO_AUTOMATION_TOKEN" gh api -X PATCH "repos/$GITHUB_REPOSITORY/actions/variables/AUTO_FORMAT_LAST_SUCCESS_SHA" -f name="AUTO_FORMAT_LAST_SUCCESS_SHA" -f value="$sha" >/dev/null 2>&1; then
+              echo "Recorded AUTO_FORMAT_LAST_SUCCESS_SHA=$sha"
+            elif GH_TOKEN="$REPO_AUTOMATION_TOKEN" gh api -X POST "repos/$GITHUB_REPOSITORY/actions/variables" -f name="AUTO_FORMAT_LAST_SUCCESS_SHA" -f value="$sha" >/dev/null 2>&1; then
+              echo "Created AUTO_FORMAT_LAST_SUCCESS_SHA=$sha"
+            else
+              echo "::warning::could not update AUTO_FORMAT_LAST_SUCCESS_SHA; the next run will re-check this range."
+            fi
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          changed_file="$(mktemp)"
+          trap 'rm -f "$changed_file"' EXIT
+          max_attempts=3
+          for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+            # Always start from the latest remote tip so a push race retries
+            # the formatting pass instead of rebasing stale formatter output.
+            git fetch origin main
+            git reset --hard origin/main
+            head_sha="$(git rev-parse HEAD)"
+
+            marker="${LAST_SUCCESS_SHA:-}"
+            if [[ -z "$marker" ]]; then
+              marker="$(gh run list --workflow=auto-format.yml --status success --limit 1 \
+                --json headSha --jq '.[0].headSha // empty' 2>/dev/null || true)"
+            fi
+            if [[ -n "$marker" && "$marker" == "$head_sha" ]]; then
+              echo "main is unchanged since the last successful format pass ($head_sha); nothing to do."
+              exit 0
+            fi
+
+            : > "$changed_file"
+            if [[ -n "$marker" ]] \
+               && git cat-file -e "${marker}^{commit}" 2>/dev/null \
+               && git merge-base --is-ancestor "$marker" HEAD; then
+              git diff --name-only --diff-filter=ACMR "$marker...$head_sha" > "$changed_file"
+            else
+              git log --since="25 hours ago" --pretty=format: --name-only \
+                | sort -u | while IFS= read -r f; do
+                    if [[ -n "$f" && -f "$f" ]]; then
+                      printf '%s\n' "$f"
+                    fi
+                  done > "$changed_file"
+            fi
+
+            # Keep only what this repo's vp fmt actually formats: the config
+            # ignores css/svg/html/md/mdx/yaml/yml, package.json and
+            # tsconfig*.json. Workflow files are also skipped because the
+            # default token may not push them.
+            mapfile -t changed_files < <(
+              grep -E '\.(ts|tsx|js|jsx|mjs|cjs|mts|cts|json|jsonc)$' "$changed_file" || true \
+                | grep -vE '(^|/)(package\.json|tsconfig[^/]*\.json|pnpm-lock\.yaml)$' || true
+            )
+            if ((${#changed_files[@]} == 0)); then
+              echo "No formattable files changed."
+              record_success
+              exit 0
+            fi
+
+            printf 'Formatting %s file(s):\n' "${#changed_files[@]}"
+            printf '  %s\n' "${changed_files[@]}"
+            # vp fmt exits 2 when nothing it can format was matched.
+            fmt_status=0
+            pnpm exec vp fmt -- "${changed_files[@]}" || fmt_status=$?
+            if ((fmt_status != 0 && fmt_status != 2)); then
+              echo "::error::vp fmt failed with exit $fmt_status"
+              exit "$fmt_status"
+            fi
+
+            git add -u
+            if git diff --cached --quiet; then
+              echo "vp fmt made no changes."
+              record_success
+              exit 0
+            fi
+
+            git commit -m "style(format): auto-format on main"
+            if git push origin HEAD:main; then
+              echo "Pushed auto-format commit."
+              record_success
+              exit 0
+            fi
+
+            echo "Push failed; checking whether main advanced during this pass."
+            git fetch origin main
+            main_sha="$(git rev-parse origin/main)"
+            if [[ "$main_sha" == "$head_sha" ]]; then
+              echo "::error::Auto-format push failed and main did not advance; not retrying the same revision."
+              exit 1
+            fi
+            echo "main advanced during the format pass ($head_sha -> $main_sha); retrying against the latest main (attempt $attempt/$max_attempts)."
+            git reset --hard origin/main
+          done
+          echo "::warning title=Auto-format retries exhausted::main kept advancing during all $max_attempts format passes; the next scheduled run will retry."
+          exit 75
